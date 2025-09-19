@@ -112,14 +112,17 @@ async function processAudioBuffer(ws, session, env) {
   session.isProcessing = true;
 
   try {
-    // Convert buffer to Uint8Array
-    const audioData = new Uint8Array(session.audioBuffer);
+    // session.audioBuffer contains int16 samples (signed 16-bit)
+    // Convert the array of int samples into an Int16Array and get the underlying bytes
+    const int16 = Int16Array.from(session.audioBuffer);
+    const audioBytes = new Uint8Array(int16.buffer);
 
-    console.log(`Processing ${audioData.length} bytes of audio for session ${session.id}`);
+    console.log(`Processing ${audioBytes.length} bytes (${int16.length} samples) of audio for session ${session.id}`);
 
-    // Send to Workers AI for speech-to-text
+    // Send to Workers AI for speech-to-text. Provide byte array and explicit sample rate.
     const sttResponse = await env.AI.run('@cf/openai/whisper', {
-      audio: [...audioData]
+      audio: [...audioBytes],
+      sample_rate: 16000
     });
 
     // Extract transcription
