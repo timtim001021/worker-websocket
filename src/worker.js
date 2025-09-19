@@ -28,35 +28,41 @@ export default {
 
       console.log(`New WebSocket session: ${session.id}`);
 
-      // Handle incoming messages
-      server.addEventListener('message', async (event) => {
-        try {
-          const data = JSON.parse(event.data);
+        // Handle incoming messages (non-blocking): do not await long-running work inside the event handler
+        server.addEventListener('message', (event) => {
+          let data;
+          try {
+            data = JSON.parse(event.data);
+          } catch (error) {
+            console.error('Message parse error:', error?.message);
+            server.send(JSON.stringify({ type: 'error', message: 'Invalid message format', error: { message: error?.message } }));
+            return;
+          }
 
-          if (data.type === 'audio_chunk') {
-            // Handle streaming audio chunk
-            await handleAudioChunk(server, data, session, env);
-          } else if (data.type === 'end_stream') {
-            // Process accumulated audio
-            await processAudioBuffer(server, session, env);
-          } else if (data.type === 'ping') {
-            // Keep-alive
-            server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+          try {
+            if (data.type === 'audio_chunk') {
+              // fire-and-forget: handle chunk asynchronously
+              handleAudioChunk(server, data, session, env).catch((err) => {
+                console.error('handleAudioChunk error:', err?.message, err?.stack);
+                try { server.send(JSON.stringify({ type: 'error', message: 'Chunk handling failed', error: { message: err?.message } })); } catch(e){}
+              });
+            } else if (data.type === 'end_stream') {
+              // process accumulated audio asynchronously
+              processAudioBuffer(server, session, env).catch((err) => {
+                console.error('processAudioBuffer error:', err?.message, err?.stack);
+                try { server.send(JSON.stringify({ type: 'error', message: 'Processing failed', error: { message: err?.message } })); } catch(e){}
+              });
+            } else if (data.type === 'ping') {
+              // Keep-alive
+              server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            }
+          } catch (error) {
+            console.error('Message handling error:', error?.message, error?.stack);
+            try { server.send(JSON.stringify({ type: 'error', message: 'Failed to process message', error: { message: error?.message } })); } catch(e){}
           }
 
           session.lastActivity = Date.now();
-        } catch (error) {
-          console.error('Message handling error:', error?.message, error?.stack);
-          server.send(JSON.stringify({
-            type: 'error',
-            message: 'Failed to process message',
-            error: {
-              message: error?.message || String(error),
-              stack: (error && error.stack) ? String(error.stack).split('\n').slice(0,5).join('\n') : undefined
-            }
-          }));
-        }
-      });
+        });
 
       // Handle connection close
       server.addEventListener('close', () => {
@@ -119,11 +125,17 @@ async function processAudioBuffer(ws, session, env) {
 
     console.log(`Processing ${audioBytes.length} bytes (${int16.length} samples) of audio for session ${session.id}`);
 
+    // Helper: wrap a promise with a timeout to avoid indefinite hangs
+    const withTimeout = (p, ms) => Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
+    ]);
+
     // Send to Workers AI for speech-to-text. Provide byte array and explicit sample rate.
-    const sttResponse = await env.AI.run('@cf/openai/whisper', {
+    const sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', {
       audio: [...audioBytes],
       sample_rate: 16000
-    });
+    }), 20000);
 
     // Extract transcription
     const transcription = sttResponse.text || '';
@@ -179,10 +191,10 @@ async function generateResponse(ws, userText, env) {
     }));
 
     // Generate speech from text using Workers AI TTS
-    const ttsResponse = await env.AI.run('@cf/deepgram/aura-1', {
+    const ttsResponse = await withTimeout(env.AI.run('@cf/deepgram/aura-1', {
       text: responseText,
       language: 'en'
-    });
+    }), 15000);
 
     // Send audio response back
     if (ttsResponse.audio) {
