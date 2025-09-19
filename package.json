@@ -1,0 +1,17 @@
+{
+  "name": "conversational-phone-saas",
+  "version": "1.0.0",
+  "description": "Real-time conversational phone system using Cloudflare Workers",
+  "main": "src/worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "test": "python3 test/test_connection.py"
+  },
+  "keywords": ["cloudflare", "workers", "websocket", "ai", "speech"],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
