@@ -46,10 +46,14 @@ export default {
 
           session.lastActivity = Date.now();
         } catch (error) {
-          console.error('Message handling error:', error);
+          console.error('Message handling error:', error?.message, error?.stack);
           server.send(JSON.stringify({
             type: 'error',
-            message: 'Failed to process message'
+            message: 'Failed to process message',
+            error: {
+              message: error?.message || String(error),
+              stack: (error && error.stack) ? String(error.stack).split('\n').slice(0,5).join('\n') : undefined
+            }
           }));
         }
       });
@@ -138,10 +142,14 @@ async function processAudioBuffer(ws, session, env) {
     session.audioBuffer = [];
 
   } catch (error) {
-    console.error('Audio processing error:', error);
+    console.error('Audio processing error:', error?.message, error?.stack);
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Failed to process audio'
+      message: 'Failed to process audio',
+      error: {
+        message: error?.message || String(error),
+        stack: (error && error.stack) ? String(error.stack).split('\n').slice(0,5).join('\n') : undefined
+      }
     }));
   } finally {
     session.isProcessing = false;
@@ -183,10 +191,14 @@ async function generateResponse(ws, userText, env) {
     }
 
   } catch (error) {
-    console.error('Response generation error:', error);
+    console.error('Response generation error:', error?.message, error?.stack);
     ws.send(JSON.stringify({
       type: 'error',
-      message: 'Failed to generate response'
+      message: 'Failed to generate response',
+      error: {
+        message: error?.message || String(error),
+        stack: (error && error.stack) ? String(error.stack).split('\n').slice(0,5).join('\n') : undefined
+      }
     }));
   }
 }
