@@ -104,10 +104,8 @@ async function handleAudioChunk(ws, data, session, env) {
     buffer_size: session.audioBuffer.length
   }));
 
-  // Process if buffer is getting large or if we detect speech end
-  if (session.audioBuffer.length > 16000 * 2) { // ~2 seconds at 16kHz
-    await processAudioBuffer(ws, session, env);
-  }
+  // Do not auto-process here to avoid many AI.run calls and potential format issues.
+  // Processing will occur on explicit 'end_stream' from the client.
 }
 
 async function processAudioBuffer(ws, session, env) {
@@ -125,16 +123,52 @@ async function processAudioBuffer(ws, session, env) {
 
     console.log(`Processing ${audioBytes.length} bytes (${int16.length} samples) of audio for session ${session.id}`);
 
+    // Build a minimal WAV header (PCM 16-bit, mono)
+    const buildWav = (pcmBytes, sampleRate = 16000, numChannels = 1, bitsPerSample = 16) => {
+      const header = new ArrayBuffer(44);
+      const view = new DataView(header);
+      const blockAlign = numChannels * bitsPerSample / 8;
+      const byteRate = sampleRate * blockAlign;
+      const dataSize = pcmBytes.length; // bytes
+
+      // RIFF identifier
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + dataSize, true); // file length - 8
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true); // PCM chunk length
+      view.setUint16(20, 1, true); // Audio format (1 = PCM)
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, dataSize, true);
+
+      const wav = new Uint8Array(44 + dataSize);
+      wav.set(new Uint8Array(header), 0);
+      wav.set(pcmBytes, 44);
+      return wav;
+    };
+
+    const writeString = (view, offset, str) => {
+      for (let i = 0; i < str.length; i++) {
+        view.setUint8(offset + i, str.charCodeAt(i));
+      }
+    };
+
+    const wavBytes = buildWav(audioBytes, 16000, 1, 16);
+
     // Helper: wrap a promise with a timeout to avoid indefinite hangs
     const withTimeout = (p, ms) => Promise.race([
       p,
       new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
     ]);
 
-    // Send to Workers AI for speech-to-text. Provide byte array and explicit sample rate.
+    // Send WAV container to Workers AI for speech-to-text.
     const sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', {
-      audio: [...audioBytes],
-      sample_rate: 16000
+      audio: [...wavBytes]
     }), 20000);
 
     // Extract transcription
