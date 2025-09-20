@@ -295,14 +295,45 @@ async function processAudioBuffer(ws, session, env) {
       new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
     ]);
 
-    // Call the model with a base64 data URL payload (most bindings expect a string here).
-    let sttResponse;
-    try {
-      const base64 = bytesToBase64(wavBytes);
-      const dataUrl = 'data:audio/wav;base64,' + base64;
-      sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', { audio: dataUrl }), 20000);
-    } catch (err) {
-      console.error('AI.run (STT) failed:', err?.message, err?.stack);
+    // Try several payload shapes to find what the AI binding accepts for audio.
+    const base64 = bytesToBase64(wavBytes);
+    const dataUrl = 'data:audio/wav;base64,' + base64;
+
+    const payloadAttempts = [
+      { desc: 'object-audio-uint8', payload: { audio: wavBytes } },
+      { desc: 'object-audio-base64', payload: { audio: base64 } },
+      { desc: 'object-audio-dataUrl', payload: { audio: dataUrl } },
+      { desc: 'string-dataUrl', payload: dataUrl },
+      { desc: 'object-audio-array', payload: { audio: Array.from(wavBytes) } },
+      { desc: 'object-input-dataUrl', payload: { input: dataUrl } },
+      // Additional plausible shapes
+      { desc: 'object-audio-content', payload: { audio: { content: base64 } } },
+      { desc: 'object-audio-data', payload: { audio: { data: base64 } } },
+      { desc: 'object-file-dataUrl', payload: { file: dataUrl } },
+      { desc: 'object-content-dataUrl', payload: { content: dataUrl } },
+      { desc: 'object-input-audio', payload: { input: { audio: dataUrl } } },
+      { desc: 'object-audio_url', payload: { audio_url: dataUrl } },
+      { desc: 'object-url', payload: { url: dataUrl } },
+      { desc: 'object-media', payload: { media: dataUrl } }
+    ];
+
+    let sttResponse = null;
+    for (const attempt of payloadAttempts) {
+      try {
+        console.log('AI.run attempt:', attempt.desc, typeof attempt.payload, Array.isArray(attempt.payload) ? 'array' : Object.keys(attempt.payload || {}));
+        sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', attempt.payload), 20000);
+        console.log('AI.run succeeded with attempt:', attempt.desc);
+        break;
+      } catch (err) {
+        // Log detailed error for this attempt so we can see why schema rejected it
+        console.warn('AI.run attempt failed:', attempt.desc, err?.message);
+        console.warn(err?.stack || err);
+        // keep trying next shapes
+      }
+    }
+    if (!sttResponse) {
+      const err = new Error('All AI.run payload attempts failed');
+      console.error(err);
       throw err;
     }
 
