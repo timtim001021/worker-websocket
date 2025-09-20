@@ -147,6 +147,62 @@ export default {
             } else if (data.type === 'ping') {
               // Keep-alive
               server.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+            } else if (data.type === 'dump_wav' || data.type === 'echo_wav') {
+              // Client requests the assembled WAV for debugging/inspection
+              try {
+                if (!session.audioBuffer || session.audioBuffer.length === 0) {
+                  server.send(JSON.stringify({ type: 'error', message: 'No audio buffered' }));
+                } else {
+                  const int16 = Int16Array.from(session.audioBuffer);
+                  const audioBytes = new Uint8Array(int16.buffer);
+
+                  // build minimal WAV (same format as processing)
+                  const buildWavBytes = (pcmBytes, sampleRate = 16000, numChannels = 1, bitsPerSample = 16) => {
+                    const header = new ArrayBuffer(44);
+                    const view = new DataView(header);
+                    const blockAlign = numChannels * bitsPerSample / 8;
+                    const byteRate = sampleRate * blockAlign;
+                    const dataSize = pcmBytes.length;
+                    const writeString = (view, offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+                    writeString(view, 0, 'RIFF');
+                    view.setUint32(4, 36 + dataSize, true);
+                    writeString(view, 8, 'WAVE');
+                    writeString(view, 12, 'fmt ');
+                    view.setUint32(16, 16, true);
+                    view.setUint16(20, 1, true);
+                    view.setUint16(22, numChannels, true);
+                    view.setUint32(24, sampleRate, true);
+                    view.setUint32(28, byteRate, true);
+                    view.setUint16(32, blockAlign, true);
+                    view.setUint16(34, bitsPerSample, true);
+                    writeString(view, 36, 'data');
+                    view.setUint32(40, dataSize, true);
+                    const wav = new Uint8Array(44 + dataSize);
+                    wav.set(new Uint8Array(header), 0);
+                    wav.set(pcmBytes, 44);
+                    return wav;
+                  };
+
+                  const wavBytes = buildWavBytes(audioBytes, 16000, 1, 16);
+                  // limit size to 2MB in worker response to avoid huge messages
+                  if (wavBytes.length > 2 * 1024 * 1024) {
+                    server.send(JSON.stringify({ type: 'error', message: 'WAV too large to dump', size: wavBytes.length }));
+                  } else {
+                    // base64 encode
+                    let binary = '';
+                    const chunkSize = 0x8000;
+                    for (let i = 0; i < wavBytes.length; i += chunkSize) {
+                      const slice = wavBytes.subarray(i, i + chunkSize);
+                      binary += String.fromCharCode.apply(null, slice);
+                    }
+                    const b64 = btoa(binary);
+                    server.send(JSON.stringify({ type: 'echo_wav', wavBase64: b64, sampleRate: 16000, samples: int16.length }));
+                  }
+                }
+              } catch (err) {
+                console.error('dump_wav failed', err?.message);
+                try { server.send(JSON.stringify({ type: 'error', message: 'dump_wav failed', error: { message: err?.message } })); } catch(e){}
+              }
             }
           } catch (error) {
             console.error('Message handling error:', error?.message, error?.stack);
