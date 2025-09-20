@@ -18,6 +18,9 @@ export default {
       // Handle WebSocket connection
       server.accept();
 
+      // Debug flag: enable with ?debug=1 on the WebSocket URL
+      const DEBUG_INCOMING = (new URL(request.url).searchParams.get('debug') === '1');
+
       // Initialize session state
       const session = {
         id: crypto.randomUUID(),
@@ -29,7 +32,78 @@ export default {
       console.log(`New WebSocket session: ${session.id}`);
 
         // Handle incoming messages (non-blocking): do not await long-running work inside the event handler
+        // Support both text JSON messages and binary frames (binary frames start with 0x01 then uint16 sample count, then Int16 samples)
         server.addEventListener('message', (event) => {
+          // Debug: inspect the incoming message briefly if enabled via ?debug=1
+          if (DEBUG_INCOMING) {
+            try {
+              let info = { typeof: typeof event.data };
+              if (typeof event.data === 'string') {
+                info.preview = event.data.slice(0, 256);
+              } else {
+                // try typed-array view
+                if (event.data instanceof ArrayBuffer) {
+                  const ua = new Uint8Array(event.data);
+                  const hex = Array.from(ua.subarray(0, Math.min(16, ua.length))).map(b => b.toString(16).padStart(2,'0')).join(' ');
+                  info.previewHex = hex;
+                } else if (ArrayBuffer.isView(event.data)) {
+                  const ua = new Uint8Array(event.data.buffer, event.data.byteOffset || 0, Math.min(16, event.data.byteLength || event.data.buffer.byteLength));
+                  const hex = Array.from(ua).map(b => b.toString(16).padStart(2,'0')).join(' ');
+                  info.previewHex = hex;
+                }
+              }
+              console.log('incoming message info:', info);
+            } catch (e) { console.warn('incoming debug failed', e?.message); }
+          }
+          // Update activity timestamp and reset idle timer
+          session.lastActivity = Date.now();
+          if (session.idleTimer) {
+            clearTimeout(session.idleTimer);
+          }
+          // set new idle timer to close session after 120s of inactivity
+          session.idleTimer = setTimeout(() => {
+            try { server.send(JSON.stringify({ type: 'session_closed', reason: 'idle_timeout' })); } catch(e){}
+            try { server.close(); } catch(e){}
+            console.log(`Session ${session.id} closed due to idle timeout`);
+          }, 120 * 1000);
+
+          // Robust binary message detection: accept ArrayBuffer, TypedArray views, and DataView
+          let raw = event.data;
+          let buf = null;
+          if (typeof raw !== 'string') {
+            // ArrayBuffer
+            if (raw instanceof ArrayBuffer) {
+              buf = new Uint8Array(raw);
+            } else if (ArrayBuffer.isView(raw)) {
+              // TypedArray or DataView
+              buf = new Uint8Array(raw.buffer, raw.byteOffset || 0, raw.byteLength || raw.buffer.byteLength);
+            } else if (raw && raw.buffer instanceof ArrayBuffer) {
+              buf = new Uint8Array(raw.buffer);
+            }
+          }
+
+          if (buf) {
+            try {
+              if (buf.length >= 3 && buf[0] === 0x01) {
+                // audio binary frame
+                const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+                const sampleCount = dv.getUint16(1, true);
+                // Int16 samples start at offset 3
+                const samples = new Int16Array(buf.buffer, buf.byteOffset + 3, sampleCount);
+                // push samples into session buffer
+                for (let i = 0; i < samples.length; i++) session.audioBuffer.push(samples[i]);
+                // send ack
+                try { server.send(JSON.stringify({ type: 'chunk_received', chunk_size: samples.length, buffer_size: session.audioBuffer.length })); } catch(e){}
+                return;
+              }
+            } catch (err) {
+              console.error('Binary message handling error:', err?.message);
+              try { server.send(JSON.stringify({ type: 'error', message: 'Invalid binary frame', error: { message: err?.message } })); } catch(e){}
+              return;
+            }
+          }
+
+          // Otherwise, assume text JSON
           let data;
           try {
             data = JSON.parse(event.data);
@@ -60,8 +134,6 @@ export default {
             console.error('Message handling error:', error?.message, error?.stack);
             try { server.send(JSON.stringify({ type: 'error', message: 'Failed to process message', error: { message: error?.message } })); } catch(e){}
           }
-
-          session.lastActivity = Date.now();
         });
 
       // Handle connection close
@@ -92,6 +164,14 @@ export default {
     return new Response('WebSocket connection required', { status: 426 });
   }
 };
+
+  // Hoisted helper: wrap a promise with a timeout to avoid indefinite hangs when calling AI.run
+  function withTimeout(p, ms) {
+    return Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
+    ]);
+  }
 
 async function handleAudioChunk(ws, data, session, env) {
   // Add audio chunk to buffer
@@ -160,16 +240,63 @@ async function processAudioBuffer(ws, session, env) {
 
     const wavBytes = buildWav(audioBytes, 16000, 1, 16);
 
+    // Helper: convert Uint8Array to base64 (chunked to avoid call-size limits)
+    const bytesToBase64 = (bytes) => {
+      let binary = '';
+      const chunkSize = 0x8000; // 32KB chunk
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const slice = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode.apply(null, slice);
+      }
+      return btoa(binary);
+    };
+
+    // Send lightweight diagnostics (head/tail + sizes) so we can correlate failures
+    try {
+      const head = bytesToBase64(wavBytes.subarray(0, Math.min(64, wavBytes.length)));
+      const tail = bytesToBase64(wavBytes.subarray(Math.max(0, wavBytes.length - 64)));
+      const debugMsg = {
+        type: 'processing_debug',
+        bytesLength: wavBytes.length,
+        samples: int16.length,
+        sampleRate: 16000,
+        headBase64: head,
+        tailBase64: tail,
+        timestamp: Date.now()
+      };
+      // best-effort send; ignore failures
+      try { ws.send(JSON.stringify(debugMsg)); } catch(e){}
+      console.log('Processing debug:', { bytesLength: wavBytes.length, samples: int16.length });
+    } catch (e) {
+      console.warn('Failed to generate processing debug', e?.message);
+    }
+
     // Helper: wrap a promise with a timeout to avoid indefinite hangs
     const withTimeout = (p, ms) => Promise.race([
       p,
       new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
     ]);
 
-    // Send WAV container to Workers AI for speech-to-text.
-    const sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', {
-      audio: [...wavBytes]
-    }), 20000);
+    // Try calling the model with a binary-safe payload. If it fails (3010 or other),
+    // retry using a base64 data URL as fallback to avoid JSON-number-array serialization issues.
+    let sttResponse;
+    const runModel = (payload) => withTimeout(env.AI.run('@cf/openai/whisper', payload), 20000);
+
+    try {
+      // Preferred: pass the Uint8Array directly (binary) if binding supports it
+      sttResponse = await runModel({ audio: wavBytes });
+    } catch (firstError) {
+      console.warn('Primary AI.run failed, will retry with base64 fallback:', firstError?.message);
+      try {
+        const base64 = bytesToBase64(wavBytes);
+        const dataUrl = 'data:audio/wav;base64,' + base64;
+        sttResponse = await runModel({ audio: dataUrl });
+      } catch (secondError) {
+        // If fallback also fails, rethrow the original error for reporting
+        console.error('Both primary and fallback AI.run failed', { first: firstError?.message, second: secondError?.message });
+        throw secondError || firstError;
+      }
+    }
 
     // Extract transcription
     const transcription = sttResponse.text || '';
