@@ -295,30 +295,21 @@ async function processAudioBuffer(ws, session, env) {
       new Promise((_, rej) => setTimeout(() => rej(new Error('AI.run timed out')), ms))
     ]);
 
-    // Try calling the model with a binary-safe payload. If it fails (3010 or other),
-    // retry using a base64 data URL as fallback to avoid JSON-number-array serialization issues.
+    // Call the model with a base64 data URL payload (most bindings expect a string here).
     let sttResponse;
-    const runModel = (payload) => withTimeout(env.AI.run('@cf/openai/whisper', payload), 20000);
-
     try {
-      // Preferred: pass the Uint8Array directly (binary) if binding supports it
-      sttResponse = await runModel({ audio: wavBytes });
-    } catch (firstError) {
-      console.warn('Primary AI.run failed, will retry with base64 fallback:', firstError?.message);
-      try {
-        const base64 = bytesToBase64(wavBytes);
-        const dataUrl = 'data:audio/wav;base64,' + base64;
-        sttResponse = await runModel({ audio: dataUrl });
-      } catch (secondError) {
-        // If fallback also fails, rethrow the original error for reporting
-        console.error('Both primary and fallback AI.run failed', { first: firstError?.message, second: secondError?.message });
-        throw secondError || firstError;
-      }
+      const base64 = bytesToBase64(wavBytes);
+      const dataUrl = 'data:audio/wav;base64,' + base64;
+      sttResponse = await withTimeout(env.AI.run('@cf/openai/whisper', { audio: dataUrl }), 20000);
+    } catch (err) {
+      console.error('AI.run (STT) failed:', err?.message, err?.stack);
+      throw err;
     }
 
-    // Extract transcription
-    const transcription = sttResponse.text || '';
-    console.log(`Transcription: "${transcription}"`);
+  // Log raw STT response for diagnostics and extract transcription
+  console.log('STT raw response:', typeof sttResponse, Object.keys(sttResponse || {}));
+  const transcription = sttResponse && (sttResponse.text || sttResponse.transcript || '') || '';
+  console.log(`Transcription: "${transcription}"`);
 
     // Send transcription back to client
     ws.send(JSON.stringify({
