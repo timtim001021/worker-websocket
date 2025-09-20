@@ -88,8 +88,26 @@ export default {
                 // audio binary frame
                 const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
                 const sampleCount = dv.getUint16(1, true);
-                // Int16 samples start at offset 3
-                const samples = new Int16Array(buf.buffer, buf.byteOffset + 3, sampleCount);
+                // Int16 samples start at offset 3; ensure we have enough bytes
+                const expectedBytes = sampleCount * 2;
+                if (buf.byteLength < 3 + expectedBytes) throw new Error('binary frame too short');
+                // Create a compact copy of the sample bytes (aligned) to avoid TypedArray byteOffset alignment requirements
+                const sampleBytes = buf.subarray(3, 3 + expectedBytes);
+                let samples;
+                try {
+                  // Fast path: copy the bytes and view as Int16Array
+                  const sampleCopy = sampleBytes.slice(); // creates a new ArrayBuffer with byteOffset === 0
+                  samples = new Int16Array(sampleCopy.buffer);
+                } catch (e) {
+                  // Fallback: some engines may throw if we try to create typed arrays from unaligned buffers.
+                  // Use DataView.getInt16 to build the Int16Array explicitly.
+                  const dvSamples = new Int16Array(sampleCount);
+                  const sampleDv = new DataView(sampleBytes.buffer, sampleBytes.byteOffset, sampleBytes.byteLength);
+                  for (let i = 0; i < sampleCount; i++) {
+                    dvSamples[i] = sampleDv.getInt16(i * 2, true);
+                  }
+                  samples = dvSamples;
+                }
                 // push samples into session buffer
                 for (let i = 0; i < samples.length; i++) session.audioBuffer.push(samples[i]);
                 // send ack
